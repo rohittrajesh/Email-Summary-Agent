@@ -1,0 +1,2 @@
+[console_scripts]
+email-summarizer = email_summarizer.cli:main
