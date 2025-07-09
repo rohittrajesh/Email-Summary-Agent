@@ -5,6 +5,8 @@ src/email_summarizer/_gmail_setup.py
 src/email_summarizer/classifier.py
 src/email_summarizer/cli.py
 src/email_summarizer/fetcher.py
+src/email_summarizer/outlook_fetcher.py
+src/email_summarizer/outlook_setup.py
 src/email_summarizer/parser.py
 src/email_summarizer/summarizer.py
 src/email_summarizer/utils.py

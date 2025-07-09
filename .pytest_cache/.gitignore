@@ -1,0 +1,22 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# VSCode & Mac system files
+.vscode/
+.DS_Store
+
+# Secret credentials
+.env
+credentials.json
+token.json

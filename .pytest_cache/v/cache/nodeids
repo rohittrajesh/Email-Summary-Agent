@@ -1,0 +1,10 @@
+[
+  "src/tests/test_classifier.py::test_classify[I want to update my billing address on your invoice.-Invoice/Tax]",
+  "src/tests/test_classifier.py::test_classify[Please send me a quote for 100 units of widget X.-Quotation]",
+  "src/tests/test_classifier.py::test_classify_empty",
+  "src/tests/test_classifier.py::test_classify_monkeypatched",
+  "src/tests/test_parser.py::test_parse_email_empty",
+  "src/tests/test_parser.py::test_parse_email_simple",
+  "src/tests/test_parser.py::test_parse_real_email",
+  "src/tests/test_summarizer.py::test_summarize_empty"
+]
