@@ -1,15 +1,15 @@
 # src/email_summarizer/summarizer.py
 
-import os
 from typing import List, Dict
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from openai import OpenAI
+import os 
+import openai
 
-# Instantiate the client (uses OPENAI_API_KEY from .env)
-client = OpenAI()
+# no longer need an OpenAI() client object—just call the package methods
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # — Chunking constants ——————————————————————————————————————
 MAX_TOKENS = 2000
@@ -66,7 +66,7 @@ def _call_api(messages: List[Dict]) -> str:
     ])
     user_content = "\n".join(prompt_lines)
 
-    resp = client.chat.completions.create(
+    resp = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[{"role": "user", "content": user_content}],
         temperature=0.3,
@@ -102,7 +102,7 @@ def summarize(messages: List[Dict]) -> str:
         "Final unified summary:",
     ]
     final_content = "\n".join(final_prompt)
-    resp = client.chat.completions.create(
+    resp = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[{"role": "user", "content": final_content}],
         temperature=0.3,

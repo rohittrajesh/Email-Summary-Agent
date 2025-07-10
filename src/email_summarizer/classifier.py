@@ -3,15 +3,16 @@
 import os
 from typing import List
 from dotenv import load_dotenv
-from openai import OpenAI
+import openai
 
 # 1) Load your .env (must contain OPENAI_API_KEY)
 load_dotenv()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_KEY:
+    raise RuntimeError("Please set OPENAI_API_KEY in your environment")
+openai.api_key = OPENAI_KEY
 
-# 2) Instantiate the OpenAI client
-client = OpenAI()
-
-# 3) Your category set
+# 2) Your category set
 CATEGORIES: List[str] = [
     "Quotation",
     "Order Management",
@@ -24,7 +25,8 @@ CATEGORIES: List[str] = [
 
 def classify(text: str) -> str:
     """
-    Classify the given text into one of CATEGORIES via an LLM call.
+    Classify the given text into exactly one of CATEGORIES via an LLM call.
+    Returns the category name (no extra quotes or whitespace).
     """
     # 1) Empty‐text guard
     if not text or not text.strip():
@@ -39,7 +41,7 @@ def classify(text: str) -> str:
     )
 
     # 3) Call the API
-    resp = client.chat.completions.create(
+    resp = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
