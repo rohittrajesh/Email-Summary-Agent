@@ -118,6 +118,9 @@ def upsert_contact(
     2) Classify importance via AI
     3) Insert or update the Contact record
     """
+    sig_text = signature_text or ""
+    if not sig_text.strip():
+        sig_text = body
     sig_details = parse_signature_with_ai(signature_text)
     importance  = classify_importance_with_ai(
         sender=   email,

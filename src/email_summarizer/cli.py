@@ -16,12 +16,27 @@ from .summarizer        import summarize
 from .classifier        import classify
 from .utils             import compute_response_times
 from .contact_manager   import upsert_contact, Contact, _engine
+from .demo_summary      import main as run_sequential
+from . import orchestrator
 
 @click.group()
 def cli():
     """Email Summarizer & Classifier CLI (Gmail or Outlook)."""
     pass
 
+@cli.command()
+def run():
+    """Legacy (single-threaded) processor."""
+    run_sequential()
+
+@cli.command()
+@click.option("--threads",     default=4,  help="Number of LLM worker threads")
+@click.option("--fetch-count", default=5,  help="How many email threads to fetch")
+@click.option("--me",          required=True, help="Your email address (for reply-time calc)")
+def serve(threads, fetch_count, me):
+    """Run the multithreaded email pipeline."""
+    orchestrator.WORKER_COUNT = threads
+    orchestrator.serve_multithreaded(me, fetch_count)
 
 # ─── THREAD LISTING ─────────────────────────────────────────────────────────────
 
@@ -39,7 +54,6 @@ def list_threads(provider, count):
     for tid in ids:
         click.echo(tid)
 
-
 # ─── SUMMARIZE FILE ─────────────────────────────────────────────────────────────
 
 @cli.command("summarize-file")
@@ -51,7 +65,6 @@ def summarize_file(path):
     click.echo(f"Parsed {len(msgs)} message(s).\n")
     click.echo("=== AI SUMMARY ===\n")
     click.echo(summarize(msgs))
-
 
 # ─── SUMMARIZE THREAD ────────────────────────────────────────────────────────────
 
@@ -81,7 +94,6 @@ def summarize_thread(provider, thread_id):
     click.echo(f"Fetched & parsed {len(msgs)} message(s).\n")
     click.echo("=== AI SUMMARY ===\n")
     click.echo(summarize(msgs))
-
 
 # ─── PROCESS (SUMMARIZE + CLASSIFY + SAVE CONTACT) ───────────────────────────────
 
@@ -131,7 +143,6 @@ def process_thread(provider, thread_id, me):
     label = classify(summarize(msgs))
     click.echo(f"\n=== ASSIGNED CATEGORY: {label} ===")
 
-
 # ─── CLASSIFY SNIPPET ───────────────────────────────────────────────────────────
 
 @cli.command("classify-snippet")
@@ -139,7 +150,6 @@ def process_thread(provider, thread_id, me):
 def classify_snippet(snippet):
     """Classify a short text snippet."""
     click.echo(classify(snippet))
-
 
 @cli.command("classify-file")
 @click.argument("path", type=click.Path(exists=True))
@@ -149,7 +159,6 @@ def classify_file(path):
     msgs = parse_email(raw)
     combined = "\n\n".join(f"{m['date']} – {m['sender']}: {m.get('body','')}" for m in msgs)
     click.echo(classify(combined))
-
 
 @cli.command("classify-thread")
 @click.option("--provider", type=click.Choice(["gmail","outlook"]), default="gmail", show_default=True)
@@ -176,7 +185,6 @@ def classify_thread(provider, thread_id):
     combined = "\n\n".join(f"{m['date']} – {m['sender']}: {m.get('body','')}" for m in msgs)
     click.echo(classify(combined))
 
-
 # ─── REPLY TIMES ────────────────────────────────────────────────────────────────
 
 @cli.command("reply-times")
@@ -184,7 +192,6 @@ def classify_thread(provider, thread_id):
 @click.option("--me", required=True, help="Your email address to measure replies.")
 def reply_times(thread_id, me):
     """Compute how long it took you to reply in a thread/message."""
-    # we assume Gmail here; for Outlook you'd duplicate the logic above
     try:
         raws = gmail_fetch_thread(thread_id)
     except HttpError:
@@ -205,7 +212,6 @@ def reply_times(thread_id, me):
             click.echo(
                 f"{r['reply_number']}. reply to {r['from']} — {hrs:.2f} h (at {r['reply_at']:%Y-%m-%d %H:%M})"
             )
-
 
 # ─── LIST RECORDS ────────────────────────────────────────────────────────────────
 

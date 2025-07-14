@@ -2,7 +2,7 @@
 
 import os
 import base64
-from typing import List, Optional
+from typing import List, Optional, Iterator
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials   import Credentials
@@ -38,11 +38,11 @@ def _get_service():
 
     return build("gmail", "v1", credentials=creds)
 
-def fetch_thread_raw(thread_id: str) -> list[str]:
+
+def fetch_thread_raw(thread_id: str) -> List[str]:
     """
     Fetch every message in the thread as its own raw-RFC822 string.
     """
-    # 1) get the thread metadata (so we can iterate each message ID)
     thread = (
         service.users()
                .threads()
@@ -50,7 +50,7 @@ def fetch_thread_raw(thread_id: str) -> list[str]:
                .execute()
     )
 
-    raws: list[str] = []
+    raws: List[str] = []
     for m in thread.get("messages", []):
         msg = (
             service.users()
@@ -58,11 +58,12 @@ def fetch_thread_raw(thread_id: str) -> list[str]:
                    .get(userId="me", id=m["id"], format="raw")
                    .execute()
         )
-        # base64-URL‐safe decode + UTF-8
+        # base64-URL-safe decode + UTF-8
         data = base64.urlsafe_b64decode(msg["raw"])
         raws.append(data.decode("utf-8", errors="replace"))
 
     return raws
+
 
 def fetch_message_raw(message_id: str) -> str:
     """
@@ -78,6 +79,7 @@ def fetch_message_raw(message_id: str) -> str:
     raw_bytes = base64.urlsafe_b64decode(msg["raw"].encode("ASCII"))
     return raw_bytes.decode("utf-8", errors="replace")
 
+
 def list_recent_threads(n: int = 5) -> List[str]:
     """
     Return the thread IDs of your n most recent threads.
@@ -85,3 +87,22 @@ def list_recent_threads(n: int = 5) -> List[str]:
     service = _get_service()
     resp = service.users().threads().list(userId="me", maxResults=n).execute()
     return [t["id"] for t in resp.get("threads", [])]
+
+
+def fetch_emails(thread_count: int = 5) -> Iterator[List[str]]:
+    """
+    Generator that yields the raw-MIME strings for each of the most recent
+    Gmail threads. By default, fetches `thread_count=5` threads.
+
+    Usage:
+        for raw_thread in fetch_emails(10):
+            # `raw_thread` is a List[str], one raw MIME per message in the thread
+            ...
+    """
+    for thread_id in list_recent_threads(thread_count):
+        try:
+            raws = fetch_thread_raw(thread_id)
+        except Exception:
+            # If it's not a thread, fall back to single-message fetch
+            raws = [fetch_message_raw(thread_id)]
+        yield raws
