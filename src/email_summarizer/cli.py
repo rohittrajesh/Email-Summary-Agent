@@ -1,238 +1,240 @@
+#!/usr/bin/env python3
+import os
 import sys
+import base64
+import email as py_email
+from email.parser import BytesParser
+from email import policy
+from email.utils import parsedate_to_datetime
+from typing import List, Dict
 import click
-from googleapiclient.errors import HttpError
+from dotenv import load_dotenv
 
-from ._gmail_setup      import service
-from .fetcher           import (
-    fetch_thread_raw  as gmail_fetch_thread,
-    fetch_message_raw as gmail_fetch_message,
-)
-from .outlook_fetcher   import (
-    list_messages    as outlook_list_messages,
-    get_message_raw  as outlook_fetch_message,
-)
-from .parser            import parse_email
-from .summarizer        import summarize
-from .classifier        import classify
-from .utils             import compute_response_times
-from .contact_manager   import upsert_contact, Contact, _engine
-from .demo_summary      import main as run_sequential
-from . import orchestrator
+load_dotenv()
+
+from email_summarizer.fetcher    import fetch_threads, mark_as_read, RawEmail, RawThread
+from email_summarizer.parser     import parse_email, ParsedEmail
+from email_summarizer.summarizer import summarize
+from email_summarizer.classifier import classify
+from email_summarizer.utils      import extract_fields, compute_response_times
+from email_summarizer.contact_manager import upsert_contact
+import email_summarizer.service as service_module
+
 
 @click.group()
 def cli():
-    """Email Summarizer & Classifier CLI (Gmail or Outlook)."""
+    """Email Summarizer & Classifier CLI."""
     pass
+
 
 @cli.command()
 def run():
-    """Legacy (single-threaded) processor."""
-    run_sequential()
+    """Run the long-lived MailSynchronizer (blocking)."""
+    # honor the WORKER_COUNT and POLL_INTERVAL env vars
+    service_module.main()
+
 
 @cli.command()
-@click.option("--threads",     default=4,  help="Number of LLM worker threads")
-@click.option("--fetch-count", default=5,  help="How many email threads to fetch")
-@click.option("--me",          required=True, help="Your email address (for reply-time calc)")
-def serve(threads, fetch_count, me):
-    """Run the multithreaded email pipeline."""
-    orchestrator.WORKER_COUNT = threads
-    orchestrator.serve_multithreaded(me, fetch_count)
+@click.option("--threads",     default=4, help="Worker count for LLM calls")
+@click.option("--interval",    default=1.0, help="Poll interval in seconds")
+def serve(threads: int, interval: float):
+    """
+    Run the MailSynchronizer in-process, setting WORKER_COUNT and POLL_INTERVAL.
+    """
+    os.environ["WORKER_COUNT"]   = str(threads)
+    os.environ["POLL_INTERVAL"]  = str(interval)
+    service_module.main()
 
-# ─── THREAD LISTING ─────────────────────────────────────────────────────────────
 
 @cli.command("threads")
-@click.option("--provider", type=click.Choice(["gmail", "outlook"]), default="gmail", show_default=True)
-@click.option("-n", "--count", default=10, show_default=True)
-def list_threads(provider, count):
-    """List your most recent thread/message IDs."""
-    if provider == "gmail":
-        resp = service.users().threads().list(userId="me", maxResults=count).execute()
-        ids  = [t["id"] for t in resp.get("threads", [])]
-    else:
-        msgs = outlook_list_messages(top=count)
-        ids  = [m["id"] for m in msgs]
-    for tid in ids:
-        click.echo(tid)
+@click.option("-n", "--count", default=5, help="How many unread threads to list")
+def list_threads(count: int):
+    """List your most recent unread Gmail thread IDs."""
+    for t in fetch_threads(max_threads=count):
+        click.echo(t.id)
 
-# ─── SUMMARIZE FILE ─────────────────────────────────────────────────────────────
+
+# ─── Helpers for .eml file parsing ─────────────────────────────────────────────
+
+def _load_rawemail_from_file(path: str) -> RawThread:
+    """
+    Wrap a single .eml on disk as a RawThread with one RawEmail.
+    """
+    raw_bytes = open(path, "rb").read()
+    msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+
+    headers = {h: msg[h] for h in ("Date", "From", "Subject")}
+    date    = headers.get("Date", "")
+    sender  = headers.get("From", "")
+    subject = headers.get("Subject", "")
+
+    plain, html = "", ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/plain":
+                plain = part.get_payload(decode=True).decode(errors="ignore")
+            elif ct == "text/html":
+                html  = part.get_payload(decode=True).decode(errors="ignore")
+    else:
+        body = msg.get_payload(decode=True)
+        text = body.decode(errors="ignore") if body else ""
+        if msg.get_content_type() == "text/html":
+            html  = text
+        else:
+            plain = text
+
+    return RawThread(
+        thread_id=os.path.basename(path),
+        messages=[RawEmail(thread_id=os.path.basename(path),
+                           msg_id=os.path.basename(path),
+                           date=date, sender=sender,
+                           subject=subject, plain=plain, html=html)]
+    )
+
+
+# ─── SUMMARIZE / CLASSIFY LOCAL .eml ──────────────────────────────────────────
 
 @cli.command("summarize-file")
 @click.argument("path", type=click.Path(exists=True))
-def summarize_file(path):
-    """Parse and summarize a local .eml file."""
-    raw  = open(path, encoding="utf-8", errors="replace").read()
-    msgs = parse_email(raw)
-    click.echo(f"Parsed {len(msgs)} message(s).\n")
-    click.echo("=== AI SUMMARY ===\n")
-    click.echo(summarize(msgs))
+def summarize_file(path: str):
+    """Parse and AI-summarize a local .eml file."""
+    rt = _load_rawemail_from_file(path)
+    parsed = [parse_email(msg) for msg in rt.messages]
+    valid  = [p for p in parsed if p.is_valid]
+    cnt_skipped = len(parsed) - len(valid)
+    click.echo(f"Parsed {len(parsed)} message(s), skipped {cnt_skipped} invalid.\n")
 
-# ─── SUMMARIZE THREAD ────────────────────────────────────────────────────────────
+    msg_dicts = [
+        {"date": p.date, "sender": p.sender, "body": p.plain or p.html}
+        for p in valid
+    ]
+    summary = summarize(msg_dicts)
+    click.echo("=== AI-GENERATED SUMMARY ===\n")
+    click.echo(summary)
 
-@cli.command("summarize-thread")
-@click.option("--provider", type=click.Choice(["gmail","outlook"]), default="gmail", show_default=True)
-@click.argument("thread_id")
-def summarize_thread(provider, thread_id):
-    """Fetch & AI‐summarize a Gmail thread or Outlook conversation."""
-    if provider == "gmail":
-        try:
-            raws = gmail_fetch_thread(thread_id)
-        except HttpError:
-            click.echo("Warning: not a thread ID—fetching single message…")
-            raws = [gmail_fetch_message(thread_id)]
-    else:
-        try:
-            metas = outlook_list_messages(top=50, filter_q=f"conversationId eq '{thread_id}'")
-            raws = [outlook_fetch_message(m["id"]) for m in metas]
-        except Exception:
-            click.echo("Warning: fetching single Outlook message…")
-            raws = [outlook_fetch_message(thread_id)]
-
-    msgs = []
-    for r in raws:
-        msgs.extend(parse_email(r))
-
-    click.echo(f"Fetched & parsed {len(msgs)} message(s).\n")
-    click.echo("=== AI SUMMARY ===\n")
-    click.echo(summarize(msgs))
-
-# ─── PROCESS (SUMMARIZE + CLASSIFY + SAVE CONTACT) ───────────────────────────────
-
-@cli.command("process-thread")
-@click.option("--provider", type=click.Choice(["gmail","outlook"]), default="gmail", show_default=True)
-@click.argument("thread_id")
-@click.option("--me", default=None, help="Your email address (for classification context).")
-def process_thread(provider, thread_id, me):
-    """
-    Summarize + classify + save the *sender* of the last message in this thread.
-    """
-    # first summary
-    ctx = click.get_current_context()
-    ctx.invoke(summarize_thread, provider=provider, thread_id=thread_id)
-
-    # fetch raw again
-    if provider == "gmail":
-        try:
-            raws = gmail_fetch_thread(thread_id)
-        except HttpError:
-            raws = [gmail_fetch_message(thread_id)]
-    else:
-        try:
-            metas = outlook_list_messages(top=50, filter_q=f"conversationId eq '{thread_id}'")
-            raws = [outlook_fetch_message(m["id"]) for m in metas]
-        except Exception:
-            raws = [outlook_fetch_message(thread_id)]
-
-    msgs = []
-    for r in raws:
-        msgs.extend(parse_email(r))
-
-    # last message = msgs[-1]
-    last = msgs[-1]
-    contact = upsert_contact(
-        name=           last.get("sender",""),
-        email=          last.get("sender",""),
-        signature_text= last.get("body",""),
-        subject=        last.get("subject",""),
-        body=           last.get("body",""),
-        to_addrs=       last.get("to",""),
-        cc_addrs=       last.get("cc",""),
-    )
-    click.echo(f"Saved contact: {contact.name} <{contact.email}>  (Importance: {contact.importance})")
-
-    # then classification
-    label = classify(summarize(msgs))
-    click.echo(f"\n=== ASSIGNED CATEGORY: {label} ===")
-
-# ─── CLASSIFY SNIPPET ───────────────────────────────────────────────────────────
-
-@cli.command("classify-snippet")
-@click.argument("snippet")
-def classify_snippet(snippet):
-    """Classify a short text snippet."""
-    click.echo(classify(snippet))
 
 @cli.command("classify-file")
 @click.argument("path", type=click.Path(exists=True))
-def classify_file(path):
-    """Parse a .eml file and classify its body text."""
-    raw  = open(path, encoding="utf-8", errors="replace").read()
-    msgs = parse_email(raw)
-    combined = "\n\n".join(f"{m['date']} – {m['sender']}: {m.get('body','')}" for m in msgs)
-    click.echo(classify(combined))
+def classify_file(path: str):
+    """Parse a .eml file and classify its content."""
+    rt = _load_rawemail_from_file(path)
+    parsed = [parse_email(msg) for msg in rt.messages]
+    valid  = [p for p in parsed if p.is_valid]
+    msg_dicts = [
+        {"date": p.date, "sender": p.sender, "body": p.plain or p.html}
+        for p in valid
+    ]
+    label = classify(msg_dicts)
+    click.echo(f"Assigned category: {label}")
 
-@cli.command("classify-thread")
-@click.option("--provider", type=click.Choice(["gmail","outlook"]), default="gmail", show_default=True)
+
+# ─── SUMMARIZE / CLASSIFY THREAD ───────────────────────────────────────────────
+
+@cli.command("summarize-thread")
 @click.argument("thread_id")
-def classify_thread(provider, thread_id):
-    """Fetch a thread/message and classify the entire text."""
-    if provider == "gmail":
-        try:
-            raws = gmail_fetch_thread(thread_id)
-        except HttpError:
-            click.echo("Warning: not a thread ID—fetching single message…")
-            raws = [gmail_fetch_message(thread_id)]
+def summarize_thread(thread_id: str):
+    """Fetch & AI-summarize an unread Gmail thread."""
+    for rt in fetch_threads(max_threads=20):
+        if rt.id == thread_id:
+            raw_thread = rt
+            break
     else:
-        try:
-            metas = outlook_list_messages(top=50, filter_q=f"conversationId eq '{thread_id}'")
-            raws = [outlook_fetch_message(m["id"]) for m in metas]
-        except Exception:
-            raws = [outlook_fetch_message(thread_id)]
+        click.echo(f"Thread {thread_id!r} not found.")
+        return
 
-    msgs = []
-    for r in raws:
-        msgs.extend(parse_email(r))
+    parsed = [parse_email(msg) for msg in raw_thread.messages]
+    valid  = [p for p in parsed if p.is_valid]
+    skipped = len(parsed) - len(valid)
+    click.echo(f"Fetched {len(parsed)} msg(s), skipped {skipped} invalid.\n")
 
-    combined = "\n\n".join(f"{m['date']} – {m['sender']}: {m.get('body','')}" for m in msgs)
-    click.echo(classify(combined))
+    msg_dicts = [
+        {"date": p.date, "sender": p.sender, "body": p.plain or p.html}
+        for p in valid
+    ]
+    summary = summarize(msg_dicts)
+    click.echo("=== AI SUMMARY ===\n")
+    click.echo(summary)
+    category = classify(msg_dicts)
+    click.echo(f"\n=== ASSIGNED CATEGORY ===\n{category}")
+
+
+@cli.command("process-thread")
+@click.argument("thread_id")
+def process_thread(thread_id: str):
+    """
+    Summarize, classify & save contact info for the last message in a thread.
+    """
+    # Summarize & classify
+    ctx = click.get_current_context()
+    ctx.invoke(summarize_thread, thread_id=thread_id)
+
+    # Re-fetch for contact upsert
+    for rt in fetch_threads(max_threads=20):
+        if rt.id == thread_id:
+            raw_thread = rt
+            break
+    else:
+        return
+
+    parsed = [parse_email(msg) for msg in raw_thread.messages]
+    valid  = [p for p in parsed if p.is_valid]
+    if not valid:
+        click.echo("No valid messages to upsert contact.")
+        return
+
+    last = valid[-1]
+    contact = upsert_contact([p for p in parsed])
+    click.echo(f"\nSaved contact: {contact.name} <{contact.email}>  (Importance: {contact.importance})")
+
 
 # ─── REPLY TIMES ────────────────────────────────────────────────────────────────
 
 @cli.command("reply-times")
 @click.argument("thread_id")
-@click.option("--me", required=True, help="Your email address to measure replies.")
-def reply_times(thread_id, me):
-    """Compute how long it took you to reply in a thread/message."""
-    try:
-        raws = gmail_fetch_thread(thread_id)
-    except HttpError:
-        click.echo("Warning: not a thread ID—fetching single message…")
-        raws = [gmail_fetch_message(thread_id)]
+@click.option("--me", required=True, help="Your email address for reply-time calc")
+def reply_times(thread_id: str, me: str):
+    """Compute how long it took you to reply in a thread."""
+    for rt in fetch_threads(max_threads=20):
+        if rt.id == thread_id:
+            raw_thread = rt
+            break
+    else:
+        click.echo(f"Thread {thread_id!r} not found.")
+        return
 
-    msgs = []
-    for r in raws:
-        msgs.extend(parse_email(r))
+    parsed = [parse_email(msg) for msg in raw_thread.messages]
+    valid  = [p for p in parsed if p.is_valid]
 
-    click.echo(f"Fetched & parsed {len(msgs)} message(s).\n")
-    recs = compute_response_times(msgs, me)
+    msg_dicts = [
+        {"date": p.date, "sender": p.sender, "body": p.plain or p.html}
+        for p in valid
+    ]
+    recs = compute_response_times(msg_dicts)
     if not recs:
-        click.echo(f"No replies by {me} found in this thread.")
+        click.echo(f"No replies by {me} found.")
     else:
         for r in recs:
-            hrs = r["delta"].total_seconds() / 3600
-            click.echo(
-                f"{r['reply_number']}. reply to {r['from']} — {hrs:.2f} h (at {r['reply_at']:%Y-%m-%d %H:%M})"
-            )
-
-# ─── LIST RECORDS ────────────────────────────────────────────────────────────────
-
-@cli.command("list-records")
-def list_records():
-    """List all saved contacts."""
-    from sqlalchemy.orm import Session as _Session
-    with _Session(_engine) as sess:
-        for c in sess.query(Contact).all():
-            click.echo(
-                f"{c.name} <{c.email}>  |  "
-                f"Company: {c.company}  |  "
-                f"Address: {c.address}  |  "
-                f"Phone: {c.phone}  |  "
-                f"Title: {c.job_title}  |  "
-                f"Importance: {c.importance}"
-            )
+            hrs = r["delta_seconds"] / 3600
+            click.echo(f"{r['reply_number']}. reply to {r['from']} — {hrs:.2f}h at {r['reply_at']}")
 
 
-def main():
-    cli()
+# ─── LIST SAVED CONTACTS ───────────────────────────────────────────────────────
+
+@cli.command("list-contacts")
+def list_contacts():
+    """List all contacts saved in the database."""
+    from email_summarizer.db import SessionLocal
+    from email_summarizer.models import Contact
+
+    sess = SessionLocal()
+    for c in sess.query(Contact).all():
+        click.echo(
+            f"{c.name} <{c.email}> | {c.company} | {c.address} "
+            f"| {c.phone} | {c.job_title} | Importance: {c.importance}"
+        )
+    sess.close()
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    cli()

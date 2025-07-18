@@ -1,33 +1,12 @@
+# src/email_summarizer/contact_manager.py
+
 import os
 import json
-from sqlalchemy import (
-    Column, Integer, String, create_engine, select
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from .db        import SessionLocal
+from .models    import Contact
 import openai
-
-Base = declarative_base()
-
-class Contact(Base):
-    __tablename__ = "contacts"
-
-    id          = Column(Integer, primary_key=True)
-    name        = Column(String,  nullable=False)
-    email       = Column(String,  nullable=False, unique=True)
-    company     = Column(String,  default="N/A")
-    address     = Column(String,  default="N/A")
-    phone       = Column(String,  default="N/A")            # ← added
-    job_title   = Column(String,  default="N/A")
-    importance  = Column(
-        String,
-        default="LESS IMPORTANT",
-        nullable=False,
-        doc="‘HIGHLY IMPORTANT’ or ‘LESS IMPORTANT’"
-    )
-
-_engine = create_engine("sqlite:///contacts.db", echo=False)
-Base.metadata.create_all(_engine)
+from .utils     import extract_signature_block
 
 # ─── OpenAI init ────────────────────────────────────────────────────────────────
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -35,12 +14,11 @@ if not OPENAI_KEY:
     raise RuntimeError("Please set OPENAI_API_KEY in your environment")
 openai.api_key = OPENAI_KEY
 
-# ─── AI helpers ─────────────────────────────────────────────────────────────────
 
 def parse_signature_with_ai(sig_text: str) -> dict:
     """
     Ask the model to extract: name, company, address, phone, job_title.
-    Returns a dict with those keys (values or "N/A").
+    Returns a dict with those keys.
     """
     system = (
         "You are a parser that extracts contact signature info. "
@@ -53,14 +31,13 @@ def parse_signature_with_ai(sig_text: str) -> dict:
     resp = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
-            {"role": "system",  "content": system},
-            {"role": "user",    "content": user},
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
         ],
         temperature=0.0,
     )
-    content = resp.choices[0].message.content.strip()
     try:
-        data = json.loads(content)
+        data = json.loads(resp.choices[0].message.content)
     except Exception:
         data = {k: "N/A" for k in ("name","company","address","phone","job_title")}
 
@@ -77,13 +54,12 @@ def classify_importance_with_ai(
 ) -> str:
     """
     Ask the model: is this email HIGHLY IMPORTANT or LESS IMPORTANT?
-    Return exactly one of those two strings.
     """
     system = (
         "You are an email‐importance classifier. "
         "Given the sender, subject line, body, To and Cc headers, "
         "decide whether this message is 'HIGHLY IMPORTANT' or 'LESS IMPORTANT'. "
-        "You must reply with exactly one of those two."
+        "Reply with exactly one of those two."
     )
     user = (
         f"Sender: {sender}\n"
@@ -96,7 +72,7 @@ def classify_importance_with_ai(
         model="gpt-3.5-turbo",
         messages=[
             {"role":"system", "content": system},
-            {"role":"user",   "content": user}
+            {"role":"user",   "content": user},
         ],
         temperature=0.0,
     )
@@ -104,35 +80,37 @@ def classify_importance_with_ai(
     return ans if ans in {"HIGHLY IMPORTANT","LESS IMPORTANT"} else "LESS IMPORTANT"
 
 
-def upsert_contact(
-    name:           str,
-    email:          str,
-    signature_text: str,
-    subject:        str,
-    body:           str,
-    to_addrs:       str,
-    cc_addrs:       str
-) -> Contact:
+def upsert_contact(parsed):
     """
-    1) Parse the signature fields via AI
-    2) Classify importance via AI
-    3) Insert or update the Contact record
+    Given a ParsedEmail instance or list thereof, extract a signature snippet,
+    classify importance, then insert or update a Contact.
     """
-    sig_text = signature_text or ""
-    if not sig_text.strip():
-        sig_text = body
-    sig_details = parse_signature_with_ai(signature_text)
+    # pick the last message in the thread (or the only one)
+    last = parsed[-1] if isinstance(parsed, (list, tuple)) else parsed
+
+    # 1) pull out just the signature block (or final lines) from plain/html
+    raw_sig = (getattr(last, "plain", "") or getattr(last, "html", "") or "")
+    sig_text = extract_signature_block(raw_sig)
+
+    # 2) truncate to ~2k chars to stay under context limits
+    if len(sig_text) > 2000:
+        sig_text = sig_text[-2000:]
+
+    sig_details = parse_signature_with_ai(sig_text)
+
+    # 3) classify importance on that same snippet
     importance  = classify_importance_with_ai(
-        sender=   email,
-        subject=  subject,
-        body=     body,
-        to_addrs= to_addrs,
-        cc_addrs= cc_addrs,
+        sender=   last.sender,
+        subject=  last.subject,
+        body=     sig_text,
+        to_addrs= getattr(last, "to", ""),
+        cc_addrs=getattr(last, "cc", ""),
     )
 
+    # 4) assemble upsert details
     details = {
-        "name":       name  or sig_details["name"]   or "N/A",
-        "email":      email or "N/A",
+        "name":       sig_details["name"],
+        "email":      last.sender,
         "company":    sig_details["company"],
         "address":    sig_details["address"],
         "phone":      sig_details["phone"],
@@ -140,19 +118,23 @@ def upsert_contact(
         "importance": importance,
     }
 
-    with Session(_engine) as sess:
-        stmt     = select(Contact).where(Contact.email == details["email"])
-        existing = sess.scalars(stmt).first()
-
+    # 5) insert or update the contacts table
+    session = SessionLocal()
+    try:
+        existing = session.scalar(
+            select(Contact).where(Contact.email == details["email"])
+        )
         if existing:
-            for k,v in details.items():
+            for k, v in details.items():
                 setattr(existing, k, v)
             contact = existing
         else:
             contact = Contact(**details)
-            sess.add(contact)
+            session.add(contact)
 
-        sess.commit()
-        sess.refresh(contact)
+        session.commit()
+        session.refresh(contact)
+    finally:
+        session.close()
 
     return contact

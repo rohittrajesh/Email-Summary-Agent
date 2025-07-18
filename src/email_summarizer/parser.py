@@ -1,72 +1,55 @@
 # src/email_summarizer/parser.py
 
-import re
-import email
-from email import policy
-from email.parser import BytesParser
-from typing import List, Dict
-from html import unescape
+from typing import Optional
+from bs4 import BeautifulSoup
 
-def _get_body(msg: email.message.Message) -> str:
-    # (unchanged)
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain":
-                try:
-                    payload = part.get_payload(decode=True)
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="ignore").strip()
-                except Exception:
-                    continue
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                try:
-                    payload = part.get_payload(decode=True)
-                    charset = part.get_content_charset() or "utf-8"
-                    html = payload.decode(charset, errors="ignore")
-                    text = re.sub(r"<[^>]+>", "", html)
-                    return unescape(text).strip()
-                except Exception:
-                    continue
-        return ""
-    ctype = msg.get_content_type()
-    payload = msg.get_payload(decode=True)
-    charset = msg.get_content_charset() or "utf-8"
-    try:
-        raw = payload.decode(charset, errors="ignore")
-    except Exception:
-        raw = payload.decode("utf-8", errors="ignore")
-    if ctype == "text/plain":
-        return raw.strip()
-    if ctype == "text/html":
-        text = re.sub(r"<[^>]+>", "", raw)
-        return unescape(text).strip()
-    return ""
+class ParsedEmail:
+    """
+    Encapsulates a fetched email plus validation state.
+    """
+    def __init__(self, raw_email):
+        # copy over the basic fields
+        self.id      = raw_email.id
+        self.date    = getattr(raw_email, "date", "")    # <-- store the raw date string
+        self.sender  = raw_email.sender
+        self.subject = raw_email.subject
+        self.plain   = raw_email.plain   or ""
+        self.html    = raw_email.html    or ""
 
-def parse_email(raw: str) -> List[Dict]:
-    """
-    Given one full raw MIME string, return a single‐element list with:
-      date, sender, subject, to, cc, body
-    """
-    msg = BytesParser(policy=policy.default).parsebytes(
-        raw.encode("utf-8", errors="ignore")
-    )
-    return [{
-        "date":    msg["Date"]    or "",
-        "sender":  msg["From"]    or "",
-        "subject": msg["Subject"] or "",
-        "to":      msg.get("To", "")  or "",
-        "cc":      msg.get("Cc", "")  or "",
-        "body":    _get_body(msg),
-    }]
+        # validation status / reason
+        self.is_valid         = True
+        self.validation_error: Optional[str] = None
 
-def parse_linkedin(html: str) -> str:
+        # parsed HTML soup for downstream, if any
+        self.soup: Optional[BeautifulSoup] = None
+
+def parse_email(raw_email) -> ParsedEmail:
     """
-    Very basic HTML→text conversion: strip tags and collapse whitespace.
-    You can swap in html2text or BeautifulSoup later if needed.
+    Validate and normalize a RawEmail into a ParsedEmail.
+
+    Accepts emails with either HTML or plain-text bodies.
+    For HTML content, it parses with BeautifulSoup.
     """
-    # strip tags
-    text = re.sub(r"<[^>]+>", "", html)
-    # collapse multiple spaces/newlines
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    parsed = ParsedEmail(raw_email)
+
+    # 1) If HTML is present, attempt to parse it
+    if parsed.html.strip():
+        try:
+            parsed.soup = BeautifulSoup(parsed.html, "html.parser")
+        except Exception as e:
+            parsed.is_valid = False
+            parsed.validation_error = f"HTML parse error: {e}"
+            return parsed
+
+    # 2) Otherwise, if only plain text is present, that's valid
+    elif parsed.plain.strip():
+        # nothing else to do
+        pass
+
+    # 3) If no content at all, mark invalid
+    else:
+        parsed.is_valid = False
+        parsed.validation_error = "Email has no content"
+        return parsed
+
+    return parsed

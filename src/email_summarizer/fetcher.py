@@ -1,108 +1,147 @@
-# src/backend/fetcher.py
+# src/email_summarizer/fetcher.py
 
 import os
 import base64
-from typing import List, Optional, Iterator
+from typing import Iterator, Optional, List
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials   import Credentials
-from google_auth_oauthlib.flow    import InstalledAppFlow
-from googleapiclient.discovery    import build
-from ._gmail_setup import service
+from googleapiclient.discovery       import build
+from google.oauth2.credentials       import Credentials
+from google.auth.transport.requests  import Request
+from google_auth_oauthlib.flow       import InstalledAppFlow
 
-# Gmail API scope (read-only)
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+]
+
+# pick up these paths from ENV, falling back to the current dir
+CLIENT_SECRETS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+TOKEN_FILE          = os.getenv("GOOGLE_TOKEN_FILE",       "token.json")
+
 
 def _get_service():
-    """
-    Authenticate (or refresh) and return a Gmail service client.
-    """
     creds: Optional[Credentials] = None
 
-    # 1) Load existing tokens, if present
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    # 1) Try loading saved token
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
-    # 2) If no valid creds, run the OAuth2 flow
+    # 2) If no valid creds, do OAuth flow
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES
+                CLIENT_SECRETS_FILE,
+                SCOPES
             )
-            creds = flow.run_local_server(port=0)
-        # Save for next time
-        with open("token.json", "w") as token:
+            creds = flow.run_local_server(
+                port=0,
+                access_type="offline",
+                prompt="consent"
+            )
+        # 3) Save for next time
+        with open(TOKEN_FILE, "w") as token:
             token.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
 
 
-def fetch_thread_raw(thread_id: str) -> List[str]:
+class RawEmail:
+    def __init__(
+        self,
+        msg_id: str,
+        date:   str,
+        sender: str,
+        subject:str,
+        plain:  str,
+        html:   str
+    ):
+        self.id      = msg_id
+        self.date    = date
+        self.sender  = sender
+        self.subject = subject
+        self.plain   = plain
+        self.html    = html
+
+
+class RawThread:
+    def __init__(self, thread_id: str, messages: List[RawEmail]):
+        self.id       = thread_id
+        self.messages = messages
+
+
+def fetch_threads(
+    max_threads: int = 5,
+    query:       Optional[str] = None
+) -> Iterator[RawThread]:
     """
-    Fetch every message in the thread as its own raw-RFC822 string.
+    List up to `max_threads` UNREAD threads in INBOX, optionally
+    filtered by Gmail `q=…` syntax (e.g. "newer_than:1d").
+    Yields RawThread objects.
     """
-    thread = (
-        service.users()
-               .threads()
-               .get(userId="me", id=thread_id, fields="messages(id)")
-               .execute()
-    )
+    svc = _get_service()
 
-    raws: List[str] = []
-    for m in thread.get("messages", []):
-        msg = (
-            service.users()
-                   .messages()
-                   .get(userId="me", id=m["id"], format="raw")
-                   .execute()
-        )
-        # base64-URL-safe decode + UTF-8
-        data = base64.urlsafe_b64decode(msg["raw"])
-        raws.append(data.decode("utf-8", errors="replace"))
+    list_kwargs = {
+        "userId":     "me",
+        "maxResults": max_threads,
+        "labelIds":   ["INBOX", "UNREAD"],
+    }
+    if query:
+        list_kwargs["q"] = query
 
-    return raws
+    resp = svc.users().threads().list(**list_kwargs).execute()
+    for meta in resp.get("threads", []):
+        tid = meta["id"]
+        thread = svc.users().threads().get(
+            userId="me", id=tid, format="full"
+        ).execute()
+
+        raws: List[RawEmail] = []
+        for m in thread.get("messages", []):
+            msg = svc.users().messages().get(
+                userId="me", id=m["id"], format="full"
+            ).execute()
+
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            date    = headers.get("Date", "")
+            sender  = headers.get("From", "")
+            subject = headers.get("Subject", "")
+
+            plain, html = "", ""
+            parts = msg["payload"].get("parts") or []
+            for part in parts:
+                data = part.get("body", {}).get("data")
+                if not data:
+                    continue
+                chunk = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                mime  = part.get("mimeType", "")
+                if mime == "text/plain":
+                    plain = chunk
+                elif mime == "text/html":
+                    html = chunk
+
+            # fallback if non-multipart
+            if not parts and msg["payload"].get("body", {}).get("data"):
+                data = msg["payload"]["body"]["data"]
+                text = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                if msg["payload"].get("mimeType") == "text/html":
+                    html = text
+                else:
+                    plain = text
+
+            raws.append(RawEmail(m["id"], date, sender, subject, plain, html))
+
+        yield RawThread(tid, raws)
 
 
-def fetch_message_raw(message_id: str) -> str:
+def mark_as_read(raw_email: RawEmail):
     """
-    Fetch a single Gmail message as raw MIME.
+    Remove the UNREAD label so Gmail won’t return this message again.
     """
-    service = _get_service()
-    msg = (
-        service.users()
-               .messages()
-               .get(userId="me", id=message_id, format="raw")
-               .execute()
-    )
-    raw_bytes = base64.urlsafe_b64decode(msg["raw"].encode("ASCII"))
-    return raw_bytes.decode("utf-8", errors="replace")
-
-
-def list_recent_threads(n: int = 5) -> List[str]:
-    """
-    Return the thread IDs of your n most recent threads.
-    """
-    service = _get_service()
-    resp = service.users().threads().list(userId="me", maxResults=n).execute()
-    return [t["id"] for t in resp.get("threads", [])]
-
-
-def fetch_emails(thread_count: int = 5) -> Iterator[List[str]]:
-    """
-    Generator that yields the raw-MIME strings for each of the most recent
-    Gmail threads. By default, fetches `thread_count=5` threads.
-
-    Usage:
-        for raw_thread in fetch_emails(10):
-            # `raw_thread` is a List[str], one raw MIME per message in the thread
-            ...
-    """
-    for thread_id in list_recent_threads(thread_count):
-        try:
-            raws = fetch_thread_raw(thread_id)
-        except Exception:
-            # If it's not a thread, fall back to single-message fetch
-            raws = [fetch_message_raw(thread_id)]
-        yield raws
+    svc = _get_service()
+    svc.users().messages().modify(
+        userId="me",
+        id=raw_email.id,
+        body={"removeLabelIds": ["UNREAD"]}
+    ).execute()

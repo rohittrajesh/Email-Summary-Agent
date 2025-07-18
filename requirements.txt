@@ -8,3 +8,5 @@ google-auth-oauthlib
 msal>=1.0.0
 requests>=2.0.0
 SQLAlchemy>=1.4
+beautifulsoup4>=4.11
+lxml 
