@@ -11,11 +11,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from .db              import init_db, SessionLocal
 from .models          import Mail, SkippedMail, MailContent
 from .fetcher         import fetch_threads, mark_as_read
-from .parser          import parse_email
+from .parser          import parse_email, ParsedEmail
 from .utils           import extract_fields, compute_response_times
 from .summarizer      import summarize
 from .classifier      import classify
 from .contact_manager import upsert_contact
+
 
 LOG           = logging.getLogger(__name__)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
@@ -24,48 +25,32 @@ MAX_THREADS   = int(os.getenv("MAX_THREADS",    "10"))
 
 
 def process_thread(raw_thread):
-    """
-    Full pipeline for a single new thread:
-      • Insert Mail record
-      • Parse each message
-      • Record any SkippedMail
-      • Extract tabular fields into MailContent
-      • Summarize, classify, compute response times
-      • Upsert contact info
-      • Mark it COMPLETED (or FAILED, if anything blew up)
-      • Finally: mark each message READ so Gmail won’t give it again
-    """
     session = SessionLocal()
     thread_rec = None
 
     try:
-        # 1) Skip if somehow already in the database
+        # 0) skip if we already saw this thread
         if session.query(Mail).filter_by(message_id=raw_thread.id).first():
             return
 
-        # 2) Create the Mail row
-        last = raw_thread.messages[-1]
+        # 1) create the Mail record
         thread_rec = Mail(
-            message_id = raw_thread.id,
-            sender     = last.sender,
-            subject    = last.subject,
-            body_plain = last.plain,
-            body_html  = last.html,
-            status     = "pending",
+            message_id=raw_thread.id,
+            sender    = raw_thread.messages[0].sender,
+            subject   = raw_thread.messages[0].subject,
+            body_plain= raw_thread.messages[0].plain,
+            body_html = raw_thread.messages[0].html,
+            status    = "pending",
         )
         session.add(thread_rec)
         session.commit()
-        session.refresh(thread_rec)
 
-        # 3) Parse every message
-        parsed = []
-        for msg in raw_thread.messages:
-            # parse_email expects the full raw text of one message;
-            # if you only have plain/html, you may need to tweak this.
-            # Here we assume parse_email can consume plain text ok:
-            parsed.extend(parse_email(msg.plain or msg.html))
+        # 2) parse every message
+        parsed: list[ParsedEmail] = []
+        for raw_msg in raw_thread.messages:
+            parsed.append(parse_email(raw_msg))
 
-        # 4) Record any invalid-message skips
+        # 3) record skips
         for p in parsed:
             if not p.is_valid:
                 session.add(SkippedMail(
@@ -74,7 +59,7 @@ def process_thread(raw_thread):
                 ))
         session.commit()
 
-        # 5) Extract table fields from valid messages
+        # 4) extract structured fields
         for p in parsed:
             if not p.is_valid:
                 continue
@@ -87,25 +72,27 @@ def process_thread(raw_thread):
                 ))
         session.commit()
 
-        # 6) Summarize, classify, compute reply times
+        # 5) build the dicts for summarization/classification
         msg_dicts = []
         for p in parsed:
-            if p.is_valid:
-                msg_dicts.append({
-                    "date":   p.date,
-                    "sender": p.sender,
-                    "body":   (p.plain or p.html or "")
-                })
+            if not p.is_valid:
+                continue
+            msg_dicts.append({
+                "date":   p.date,
+                "sender": p.sender,
+                "body":   p.plain or p.html
+            })
 
+        # 6) summarize, classify, compute reply times
         thread_rec.summary        = summarize(msg_dicts)
-        thread_rec.category       = classify(msg_dicts)
+        thread_rec.category       = classify(thread_rec.summary)
         thread_rec.response_times = compute_response_times(msg_dicts)
         session.commit()
 
-        # 7) Upsert the sender as a Contact
+        # 7) upsert contact
         upsert_contact(parsed)
 
-        # 8) Mark success
+        # 8) mark success
         thread_rec.status = "completed"
         session.commit()
 
@@ -120,13 +107,12 @@ def process_thread(raw_thread):
 
     finally:
         session.close()
-        # 9) Acknowledge (mark READ) so Gmail won’t return it again
+        # 9) ack all messages so they won’t return as UNREAD
         for m in raw_thread.messages:
             try:
                 mark_as_read(m)
             except Exception:
                 pass
-
 
 def main():
     logging.basicConfig(level=logging.INFO)
